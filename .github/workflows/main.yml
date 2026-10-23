@@ -1,0 +1,25 @@
+
+name: BTC Liquidation Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install WebSocket library
+        run: pip install websockets
+
+      - name: Monitor BTC liquidations for 10 minutes
+        run: timeout 600s python -u btc_liquidation.py || test "$?" -eq 124
