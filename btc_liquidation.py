@@ -1,784 +1,352 @@
-# ==========================================
-# SMART FUTURES V11 PRO
-# BTC LIQUIDATION + MARKET DIRECTION
-# TWO INDEPENDENT MONITORS
-# ==========================================
 
-import asyncio
-import json
 import os
+import json
 import time
+import threading
 import logging
-import urllib.parse
-import urllib.request
-
 from collections import deque
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import websockets
-
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-
-SYMBOL = "BTCUSDT"
-
-BYBIT_WS = (
-    "wss://stream.bybit.com/v5/public/linear"
-)
-
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    os.getenv("BOT_TOKEN", "")
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    os.getenv("CHAT_ID", "")
-)
-
-MIN_LIQUIDATION_USD = float(
-    os.getenv("MIN_LIQUIDATION_USD", "200")
-)
-
-DIRECTION_CANDLES = 250
-
-RECONNECT_DELAY = 5
-
-PING_INTERVAL = 20
-
-
-# ==========================================
-# LOGGING
-# ==========================================
+import requests
+import websocket
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+LOG = logging.getLogger("smart-futures")
 
-logger = logging.getLogger("SMART_FUTURES_V11")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
+
+LIQ_THRESHOLD = float(os.getenv("LIQ_THRESHOLD_USD", "100000"))
+LIQ_WINDOW = int(os.getenv("LIQ_WINDOW_SECONDS", "60"))
+LIQ_COOLDOWN = int(os.getenv("LIQ_COOLDOWN_SECONDS", "45"))
+
+DIRECTION_INTERVAL = int(os.getenv("DIRECTION_INTERVAL_SECONDS", "60"))
+DIRECTION_COOLDOWN = int(os.getenv("DIRECTION_COOLDOWN_SECONDS", "900"))
+
+session = requests.Session()
+state_lock = threading.Lock()
+
+state = {
+    "ws_connected": False,
+    "last_liquidation": None,
+    "last_direction": None,
+    "direction": "WARMING_UP"
+}
+
+recent = deque()
+last_alert = {}
 
 
-# ==========================================
-# TELEGRAM
-# ==========================================
+# ===== TELEGRAM =====
 
-def telegram_request(message):
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error(
-            "TELEGRAM CONFIG MISSING"
-        )
+def telegram(message):
+    if not TOKEN or not CHAT_ID:
+        LOG.warning("Telegram credentials missing")
         return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }).encode("utf-8")
-
     try:
-
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST"
+        r = session.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=12
         )
+        r.raise_for_status()
+        return bool(r.json().get("ok"))
 
-        with urllib.request.urlopen(
-            request,
-            timeout=10
-        ) as response:
-
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        return result.get("ok", False)
-
-    except Exception:
-
-        logger.exception(
-            "TELEGRAM SEND ERROR"
-        )
-
+    except Exception as exc:
+        LOG.error("Telegram error: %s", exc)
         return False
 
 
-async def send_telegram(message):
+# ===== RENDER HTTP SERVER =====
 
-    return await asyncio.to_thread(
-        telegram_request,
-        message
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        with state_lock:
+            payload = dict(state)
+
+        body = json.dumps({
+            "service": "smart-futures-v11",
+            **payload
+        }).encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        return
+
+
+def run_http():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
     )
 
-
-# ==========================================
-# LIQUIDATION MONITOR
-# INDEPENDENT SYSTEM
-# ==========================================
-
-async def liquidation_monitor():
-
-    logger.info(
-        "LIQUIDATION MONITOR STARTED"
+    LOG.info(
+        "HTTP health server listening on port %s",
+        PORT
     )
-
-    while True:
-
-        try:
-
-            async with websockets.connect(
-                BYBIT_WS,
-                ping_interval=PING_INTERVAL,
-                ping_timeout=20,
-                open_timeout=20
-            ) as ws:
-
-                logger.info(
-                    "LIQUIDATION WS CONNECTED"
-                )
-
-                await ws.send(json.dumps({
-                    "op": "subscribe",
-                    "args": [
-                        "allLiquidation.BTCUSDT"
-                    ]
-                }))
-
-                logger.info(
-                    "LIQUIDATION SUBSCRIBE SENT"
-                )
-
-                async for raw_message in ws:
-
-                    try:
-
-                        data = json.loads(
-                            raw_message
-                        )
-
-                        if data.get("op") == "subscribe":
-
-                            logger.info(
-                                "LIQUIDATION SUBSCRIPTION: %s",
-                                data
-                            )
-
-                            continue
-
-                        if data.get("topic") != (
-                            "allLiquidation.BTCUSDT"
-                        ):
-                            continue
-
-                        events = data.get(
-                            "data", []
-                        )
-
-                        if isinstance(events, dict):
-                            events = [events]
-
-                        for event in events:
-
-                            await process_liquidation(
-                                event
-                            )
-
-                    except Exception:
-
-                        logger.exception(
-                            "LIQUIDATION MESSAGE ERROR"
-                        )
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "LIQUIDATION CONNECTION ERROR"
-            )
-
-        await asyncio.sleep(
-            RECONNECT_DELAY
-        )
+    server.serve_forever()
 
 
-# ==========================================
-# PROCESS LIQUIDATION
-# ==========================================
+# ===== INDEPENDENT LIQUIDATION MONITOR =====
 
-async def process_liquidation(event):
-
+def on_liquidation(ws, message):
     try:
+        payload = json.loads(message)
 
-        if event.get("s") != SYMBOL:
+        if payload.get("topic") != "allLiquidation.BTCUSDT":
             return
 
-        price = float(
-            event.get("p", 0)
-        )
+        events = payload.get("data", [])
 
-        quantity = float(
-            event.get("v", 0)
-        )
+        if isinstance(events, dict):
+            events = [events]
 
-        side = event.get(
-            "S", ""
-        )
+        now = time.time()
+        outgoing = []
 
-        usd_value = price * quantity
+        with state_lock:
+            for item in events:
+                side = str(item.get("S", "")).upper()
+                price = float(item.get("p", 0))
+                qty = float(item.get("v", 0))
+                usd = price * qty
 
-        if usd_value < MIN_LIQUIDATION_USD:
-            return
+                if side not in ("BUY", "SELL") or usd <= 0:
+                    continue
 
-        # Bybit liquidation side:
-        # Sell = long position liquidated
-        # Buy  = short position liquidated
+                recent.append((now, side, usd))
 
-        if side == "Sell":
+                state["last_liquidation"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
 
-            liquidation_type = (
-                "LONG LIQUIDATED"
-            )
+            while recent and recent[0][0] < now - LIQ_WINDOW:
+                recent.popleft()
 
-            icon = "🔴"
+            for side in ("BUY", "SELL"):
+                total = sum(
+                    x[2] for x in recent if x[1] == side
+                )
 
-        elif side == "Buy":
+                if (
+                    total >= LIQ_THRESHOLD
+                    and now - last_alert.get(side, 0) >= LIQ_COOLDOWN
+                ):
+                    last_alert[side] = now
 
-            liquidation_type = (
-                "SHORT LIQUIDATED"
-            )
+                    # Bybit reports the side of the liquidated position.
+                    label = (
+                        "LONG liquidations"
+                        if side == "BUY"
+                        else "SHORT liquidations"
+                    )
 
-            icon = "🟢"
+                    outgoing.append(
+                        f"🚨 BTC LIQUIDATION\n"
+                        f"{label}\n"
+                        f"Last {LIQ_WINDOW}s: ${total:,.0f}\n"
+                        f"Direction analysis: independent"
+                    )
 
-        else:
-            return
-
-        logger.info(
-            "BYBIT LIQUIDATION DETECTED | %s | $%.2f",
-            liquidation_type,
-            usd_value
-        )
-
-        message = f"""
-🚨 SMART FUTURES V11 PRO
-
-{icon} BTC LIQUIDATION ALERT
-
-Asset: BTCUSDT
-
-Type: {liquidation_type}
-
-Price: ${price:,.2f}
-
-Quantity: {quantity:.6f} BTC
-
-Liquidation Value: ${usd_value:,.2f}
-
-Source: Bybit Futures
-
-⚡ Independent Liquidation Monitor
-"""
-
-        success = await send_telegram(
-            message
-        )
-
-        if success:
-
-            logger.info(
-                "LIQUIDATION TELEGRAM SENT"
-            )
-
-        else:
-
-            logger.error(
-                "LIQUIDATION TELEGRAM FAILED"
-            )
+        for text in outgoing:
+            telegram(text)
 
     except Exception:
+        LOG.exception("Liquidation processing error")
 
-        logger.exception(
-            "PROCESS LIQUIDATION ERROR"
-        )
 
+def on_open(ws):
+    with state_lock:
+        state["ws_connected"] = True
 
-# ==========================================
-# MARKET DIRECTION
-# INDEPENDENT SYSTEM
-# ==========================================
+    LOG.info("Bybit liquidation websocket connected")
 
-candles_5m = deque(
-    maxlen=DIRECTION_CANDLES
-)
+    ws.send(json.dumps({
+        "op": "subscribe",
+        "args": ["allLiquidation.BTCUSDT"]
+    }))
 
-candles_15m = deque(
-    maxlen=DIRECTION_CANDLES
-)
 
-last_direction = None
+def on_close(ws, code, msg):
+    with state_lock:
+        state["ws_connected"] = False
 
+    LOG.warning("Websocket closed: %s %s", code, msg)
 
-# ==========================================
-# EMA CALCULATION
-# ==========================================
 
-def calculate_ema(values, period):
+def on_error(ws, err):
+    LOG.warning("Websocket error: %s", err)
 
-    if len(values) < period:
-        return None
 
-    multiplier = 2 / (period + 1)
-
-    ema = sum(
-        values[:period]
-    ) / period
-
-    for value in values[period:]:
-
-        ema = (
-            value * multiplier
-            + ema * (1 - multiplier)
-        )
-
-    return ema
-
-
-# ==========================================
-# RSI CALCULATION
-# ==========================================
-
-def calculate_rsi(values, period=7):
-
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-
-        change = (
-            values[i] - values[i - 1]
-        )
-
-        gains.append(
-            max(change, 0)
-        )
-
-        losses.append(
-            max(-change, 0)
-        )
-
-    avg_gain = sum(
-        gains[:period]
-    ) / period
-
-    avg_loss = sum(
-        losses[:period]
-    ) / period
-
-    for i in range(period, len(gains)):
-
-        avg_gain = (
-            avg_gain * (period - 1)
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1)
-            + losses[i]
-        ) / period
-
-    if avg_gain == 0 and avg_loss == 0:
-        return 50.0
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (
-        100 / (1 + rs)
-    )
-
-
-# ==========================================
-# ANALYZE TIMEFRAME
-# ==========================================
-
-def analyze_timeframe(candles):
-
-    if len(candles) < 23:
-
-        return {
-            "trend": "WARMING UP",
-            "rsi": None,
-            "ema9": None,
-            "ema21": None
-        }
-
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
-
-    ema9 = calculate_ema(
-        closes, 9
-    )
-
-    ema21 = calculate_ema(
-        closes, 21
-    )
-
-    rsi = calculate_rsi(
-        closes, 7
-    )
-
-    price = closes[-1]
-
-    if (
-        price > ema9
-        and ema9 > ema21
-        and rsi > 50
-    ):
-
-        trend = "BULLISH"
-
-    elif (
-        price < ema9
-        and ema9 < ema21
-        and rsi < 50
-    ):
-
-        trend = "BEARISH"
-
-    else:
-
-        trend = "MIXED"
-
-    return {
-        "trend": trend,
-        "rsi": rsi,
-        "ema9": ema9,
-        "ema21": ema21
-    }
-
-
-# ==========================================
-# PROCESS CLOSED CANDLES
-# ==========================================
-
-async def process_kline(data):
-
-    global last_direction
-
-    topic = data.get(
-        "topic", ""
-    )
-
-    kline_data = data.get(
-        "data", []
-    )
-
-    if isinstance(kline_data, dict):
-        kline_data = [kline_data]
-
-    for candle in kline_data:
-
-        if not candle.get(
-            "confirm", False
-        ):
-            continue
-
-        close_price = float(
-            candle["close"]
-        )
-
-        candle_start = int(
-            candle["start"]
-        )
-
-        item = {
-            "start": candle_start,
-            "close": close_price
-        }
-
-        if topic == "kline.5.BTCUSDT":
-
-            target = candles_5m
-            timeframe = "5m"
-
-        elif topic == "kline.15.BTCUSDT":
-
-            target = candles_15m
-            timeframe = "15m"
-
-        else:
-            continue
-
-        if (
-            target
-            and target[-1]["start"] == candle_start
-        ):
-
-            target[-1] = item
-
-        else:
-
-            target.append(item)
-
-        logger.info(
-            "KLINE %s CLOSED | COUNT=%d",
-            timeframe,
-            len(target)
-        )
-
-        result_5m = analyze_timeframe(
-            candles_5m
-        )
-
-        result_15m = analyze_timeframe(
-            candles_15m
-        )
-
-        trend_5m = result_5m["trend"]
-
-        trend_15m = result_15m["trend"]
-
-        if (
-            trend_5m == "WARMING UP"
-            or trend_15m == "WARMING UP"
-        ):
-
-            logger.info(
-                "DIRECTION WARMING UP | 5m=%d | 15m=%d",
-                len(candles_5m),
-                len(candles_15m)
-            )
-
-            continue
-
-        if (
-            trend_5m == "BULLISH"
-            and trend_15m == "BULLISH"
-        ):
-
-            direction = "BULLISH"
-
-        elif (
-            trend_5m == "BEARISH"
-            and trend_15m == "BEARISH"
-        ):
-
-            direction = "BEARISH"
-
-        else:
-
-            direction = "MIXED"
-
-        if direction == last_direction:
-            continue
-
-        last_direction = direction
-
-        if direction == "BULLISH":
-
-            icon = "🟢"
-
-        elif direction == "BEARISH":
-
-            icon = "🔴"
-
-        else:
-
-            icon = "🟡"
-
-        message = f"""
-📊 SMART FUTURES V11 PRO
-
-{icon} BTC MARKET DIRECTION
-
-Asset: BTCUSDT
-
-Market Direction: {direction}
-
-5m Trend: {trend_5m}
-
-15m Trend: {trend_15m}
-
-RSI7 5m: {result_5m['rsi']:.2f}
-
-RSI7 15m: {result_15m['rsi']:.2f}
-
-Price: ${close_price:,.2f}
-
-Source: Bybit Futures
-
-⚡ Independent Direction Monitor
-"""
-
-        success = await send_telegram(
-            message
-        )
-
-        if success:
-
-            logger.info(
-                "DIRECTION TELEGRAM SENT | %s",
-                direction
-            )
-
-        else:
-
-            logger.error(
-                "DIRECTION TELEGRAM FAILED"
-            )
-
-
-# ==========================================
-# DIRECTION WEBSOCKET
-# ==========================================
-
-async def direction_monitor():
-
-    logger.info(
-        "DIRECTION MONITOR STARTED"
-    )
-
+def liquidation_loop():
     while True:
-
         try:
+            ws = websocket.WebSocketApp(
+                "wss://stream.bybit.com/v5/public/linear",
+                on_open=on_open,
+                on_message=on_liquidation,
+                on_error=on_error,
+                on_close=on_close
+            )
 
-            async with websockets.connect(
-                BYBIT_WS,
-                ping_interval=PING_INTERVAL,
-                ping_timeout=20,
-                open_timeout=20
-            ) as ws:
-
-                logger.info(
-                    "DIRECTION WS CONNECTED"
-                )
-
-                await ws.send(json.dumps({
-                    "op": "subscribe",
-                    "args": [
-                        "kline.5.BTCUSDT",
-                        "kline.15.BTCUSDT"
-                    ]
-                }))
-
-                logger.info(
-                    "DIRECTION SUBSCRIBE SENT"
-                )
-
-                async for raw_message in ws:
-
-                    try:
-
-                        data = json.loads(
-                            raw_message
-                        )
-
-                        if data.get("op") == "subscribe":
-
-                            logger.info(
-                                "DIRECTION SUBSCRIPTION: %s",
-                                data
-                            )
-
-                            continue
-
-                        topic = data.get(
-                            "topic", ""
-                        )
-
-                        if topic.startswith(
-                            "kline."
-                        ):
-
-                            await process_kline(
-                                data
-                            )
-
-                    except Exception:
-
-                        logger.exception(
-                            "DIRECTION MESSAGE ERROR"
-                        )
-
-        except asyncio.CancelledError:
-            raise
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
 
         except Exception:
+            LOG.exception("Websocket reconnecting")
 
-            logger.exception(
-                "DIRECTION CONNECTION ERROR"
+        with state_lock:
+            state["ws_connected"] = False
+
+        time.sleep(5)
+
+
+# ===== INDEPENDENT DIRECTION ANALYZER =====
+
+def candles(interval, limit=120):
+    r = session.get(
+        "https://api.bybit.com/v5/market/kline",
+        params={
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "interval": interval,
+            "limit": limit
+        },
+        timeout=12
+    )
+
+    r.raise_for_status()
+    result = r.json()
+
+    if result.get("retCode") != 0:
+        raise ValueError(str(result.get("retMsg")))
+
+    rows = result["result"]["list"]
+
+    # Remove the still-forming candle.
+    closed = sorted(
+        rows,
+        key=lambda row: int(row[0])
+    )[:-1]
+
+    return [float(row[4]) for row in closed]
+
+
+def ema(values, period):
+    alpha = 2 / (period + 1)
+    result = values[0]
+
+    for v in values[1:]:
+        result = alpha * v + (1 - alpha) * result
+
+    return result
+
+
+def direction_signal():
+    c5 = candles("5")
+    c15 = candles("15")
+
+    if min(len(c5), len(c15)) < 55:
+        return "WARMING_UP", None
+
+    f5 = ema(c5, 9)
+    s5 = ema(c5, 21)
+
+    f15 = ema(c15, 9)
+    s15 = ema(c15, 21)
+
+    if f5 > s5 and f15 > s15:
+        return "BULLISH", c5[-1]
+
+    if f5 < s5 and f15 < s15:
+        return "BEARISH", c5[-1]
+
+    return "MIXED", c5[-1]
+
+
+def direction_loop():
+    last_sent = None
+    last_time = 0
+
+    while True:
+        try:
+            direction, price = direction_signal()
+
+            with state_lock:
+                state["direction"] = direction
+                state["last_direction"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+
+            LOG.info(
+                "DIRECTION %s | BTC=%s",
+                direction,
+                price
             )
 
-        await asyncio.sleep(
-            RECONNECT_DELAY
-        )
+            now = time.time()
+
+            if (
+                direction in ("BULLISH", "BEARISH")
+                and (
+                    direction != last_sent
+                    or now - last_time >= DIRECTION_COOLDOWN
+                )
+            ):
+                message = (
+                    f"📊 BTC DIRECTION\n"
+                    f"5m + 15m: {direction}\n"
+                    f"BTC: ${price:,.2f}\n"
+                    f"EMA alignment only; "
+                    f"not a trade recommendation"
+                )
+
+                if telegram(message):
+                    last_sent = direction
+                    last_time = now
+
+        except Exception:
+            LOG.exception("Direction analyzer error")
+
+        time.sleep(max(30, DIRECTION_INTERVAL))
 
 
-# ==========================================
-# MAIN
-# ==========================================
-
-async def main():
-
-    logger.info(
-        "SMART FUTURES V11 PRO STARTING"
-    )
-
-    logger.info(
-        "BTC ONLY"
-    )
-
-    logger.info(
-        "MIN LIQUIDATION USD = %.2f",
-        MIN_LIQUIDATION_USD
-    )
-
-    logger.info(
-        "LIQUIDATION AND DIRECTION INDEPENDENT"
-    )
-
-    await send_telegram(
-        "🚀 SMART FUTURES V11 PRO\n\n"
-        "BTC Liquidation Monitor: STARTED\n"
-        "BTC Market Direction: STARTING\n\n"
-        "Independent monitoring enabled."
-    )
-
-    await asyncio.gather(
-        liquidation_monitor(),
-        direction_monitor()
-    )
-
-
-# ==========================================
-# RUN
-# ==========================================
+# ===== START ALL SERVICES =====
 
 if __name__ == "__main__":
 
-    try:
+    threading.Thread(
+        target=liquidation_loop,
+        name="liquidation",
+        daemon=True
+    ).start()
 
-        asyncio.run(
-            main()
-        )
+    threading.Thread(
+        target=direction_loop,
+        name="direction",
+        daemon=True
+    ).start()
 
-    except KeyboardInterrupt:
-
-        logger.info(
-            "SMART FUTURES STOPPED"
-        )
+    run_http()
