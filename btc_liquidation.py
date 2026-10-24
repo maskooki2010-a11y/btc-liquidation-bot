@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,7 +13,9 @@ import websockets
 # SETTINGS
 BINANCE_WS = "wss://fstream.binance.com/ws/btcusdt@forceOrder"
 MIN_USD = 100_000
-MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -36,23 +39,55 @@ def start_http_server():
     server.serve_forever()
 
 
-def send_to_make(payload):
-    if not MAKE_WEBHOOK_URL:
-        print("ERROR: MAKE_WEBHOOK_URL is missing", flush=True)
+def send_to_telegram(payload):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: Telegram credentials missing", flush=True)
         return
 
+    liquidation_type = payload["liquidation_type"]
+
+    if liquidation_type == "LONG LIQUIDATION":
+        direction = "🔴 LONG LIQUIDATION"
+    else:
+        direction = "🟢 SHORT LIQUIDATION"
+
+    message = (
+        "🚨 SMART FUTURES V11 PRO\n"
+        "📊 BTC LIQUIDATION\n\n"
+        f"Type: {direction}\n"
+        f"Price: ${payload['price']:,.2f}\n"
+        f"Value: ${payload['usd_value']:,.0f}\n"
+        f"Quantity: {payload['quantity']:.4f} BTC\n"
+        "Source: BINANCE\n"
+        f"Time (UTC): {payload['time']}\n\n"
+        "⚠️ Market data only - not a trade signal"
+    )
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    data = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }).encode("utf-8")
+
     request = urllib.request.Request(
-        MAKE_WEBHOOK_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        url,
+        data=data,
         method="POST"
     )
 
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            print(f"Make response: {response.status}", flush=True)
+            result = json.load(response)
+            if result.get("ok"):
+                print("Telegram message sent successfully", flush=True)
+            else:
+                print("Telegram API returned an error", flush=True)
     except Exception as error:
-        print(f"Make webhook error: {error}", flush=True)
+        print(f"Telegram send error: {error}", flush=True)
 
 
 async def monitor():
@@ -95,20 +130,22 @@ async def monitor():
 
                     payload = {
                         "source": "BINANCE",
-                        "bot": "SMART FUTURES",
-                        "event": "BTC_LIQUIDATION",
                         "symbol": symbol,
                         "side": side,
                         "liquidation_type": liquidation_type,
                         "price": price,
                         "quantity": quantity,
                         "usd_value": round(usd_value, 2),
-                        "time": datetime.now(timezone.utc).isoformat()
+                        "time": datetime.now(
+                            timezone.utc
+                        ).isoformat()
                     }
 
                     print(json.dumps(payload), flush=True)
 
-                    await asyncio.to_thread(send_to_make, payload)
+                    await asyncio.to_thread(
+                        send_to_telegram, payload
+                    )
 
         except Exception as error:
             print(f"Connection error: {error}", flush=True)
@@ -117,5 +154,9 @@ async def monitor():
 
 
 if __name__ == "__main__":
-    Thread(target=start_http_server, daemon=True).start()
+    Thread(
+        target=start_http_server,
+        daemon=True
+    ).start()
+
     asyncio.run(monitor())
