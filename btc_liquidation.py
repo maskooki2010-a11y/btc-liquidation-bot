@@ -11,18 +11,17 @@ from threading import Thread
 import websockets
 
 
-# =====================================
+# ==========================================
 # SMART FUTURES V11 PRO
-# BTC LIQUIDATION MONITOR
-# DIRECT TELEGRAM CONNECTION
-# =====================================
+# BYBIT BTC LIQUIDATION MONITOR
+# ==========================================
 
-BINANCE_WS = (
-    "wss://fstream.binance.com/ws/"
-    "btcusdt@forceOrder"
-)
+BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 
-# TEST MODE: $200
+SYMBOL = "BTCUSDT"
+TOPIC = f"allLiquidation.{SYMBOL}"
+
+# TEST MODE
 MIN_USD = 200
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
@@ -34,9 +33,9 @@ TELEGRAM_CHAT_ID = os.environ.get(
 )
 
 
-# =====================================
-# HEALTH SERVER FOR RENDER
-# =====================================
+# ==========================================
+# RENDER HEALTH SERVER
+# ==========================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
@@ -46,7 +45,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        body = b"BTC Liquidation Monitor running"
+        body = b"Smart Futures V11 PRO - Bybit Monitor"
 
         self.send_response(200)
 
@@ -66,9 +65,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_http_server():
 
-    port = int(
-        os.environ.get("PORT", "10000")
-    )
+    port = int(os.environ.get("PORT", "10000"))
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", port),
@@ -83,28 +80,24 @@ def start_http_server():
     server.serve_forever()
 
 
-# =====================================
-# TELEGRAM MESSAGE SENDER
-# =====================================
+# ==========================================
+# TELEGRAM
+# ==========================================
 
 def send_telegram_message(message):
 
     if not TELEGRAM_BOT_TOKEN:
-
         print(
             "ERROR: TELEGRAM_BOT_TOKEN missing",
             flush=True
         )
-
         return False
 
     if not TELEGRAM_CHAT_ID:
-
         print(
             "ERROR: TELEGRAM_CHAT_ID missing",
             flush=True
         )
-
         return False
 
     url = (
@@ -159,9 +152,9 @@ def send_telegram_message(message):
         return False
 
 
-# =====================================
-# STARTUP TELEGRAM TEST
-# =====================================
+# ==========================================
+# STARTUP TEST
+# ==========================================
 
 def send_startup_test():
 
@@ -171,207 +164,11 @@ def send_startup_test():
     )
 
     message = (
-        "✅ SMART FUTURES V11 PRO\n\n"
-        "Telegram Connection Test\n\n"
+        "SMART FUTURES V11 PRO\n\n"
+        "BYBIT CONNECTION TEST\n\n"
         "Render service started.\n"
-        "BTC Liquidation Monitor active.\n"
+        "Source: BYBIT FUTURES\n"
+        "Asset: BTCUSDT\n"
         "Minimum liquidation: $200\n\n"
-        "Source: Binance Futures\n"
         "Status: TEST MESSAGE\n\n"
-        "⚠️ This is not a trade signal."
-    )
-
-    success = send_telegram_message(message)
-
-    if success:
-
-        print(
-            "TELEGRAM TEST SUCCESS",
-            flush=True
-        )
-
-    else:
-
-        print(
-            "TELEGRAM TEST FAILED",
-            flush=True
-        )
-
-
-# =====================================
-# LIQUIDATION MESSAGE
-# =====================================
-
-def send_to_telegram(payload):
-
-    liquidation_type = payload[
-        "liquidation_type"
-    ]
-
-    if liquidation_type == "LONG LIQUIDATION":
-
-        direction = "🔴 LONG LIQUIDATION"
-
-    else:
-
-        direction = "🟢 SHORT LIQUIDATION"
-
-    message = (
-        "🚨 SMART FUTURES V11 PRO\n"
-        "📊 BTC LIQUIDATION\n\n"
-        f"Type: {direction}\n"
-        f"Price: ${payload['price']:,.2f}\n"
-        f"Value: ${payload['usd_value']:,.0f}\n"
-        f"Quantity: {payload['quantity']:.4f} BTC\n"
-        "Source: BINANCE\n"
-        f"Time (UTC): {payload['time']}\n\n"
-        "⚠️ Market data only - not a trade signal"
-    )
-
-    return send_telegram_message(message)
-
-
-# =====================================
-# BINANCE LIQUIDATION MONITOR
-# =====================================
-
-async def monitor():
-
-    print(
-        "Starting BTC Liquidation Monitor",
-        flush=True
-    )
-
-    print(
-        f"Minimum liquidation: ${MIN_USD}",
-        flush=True
-    )
-
-    while True:
-
-        try:
-
-            async with websockets.connect(
-                BINANCE_WS,
-                ping_interval=20,
-                ping_timeout=20
-            ) as websocket:
-
-                print(
-                    "Connected to Binance",
-                    flush=True
-                )
-
-                async for message in websocket:
-
-                    data = json.loads(message)
-
-                    order = data.get("o", {})
-
-                    symbol = order.get("s", "")
-
-                    side = order.get("S", "")
-
-                    quantity = float(
-                        order.get("q", 0)
-                    )
-
-                    price = float(
-                        order.get("ap", 0)
-                    )
-
-                    if price <= 0:
-
-                        price = float(
-                            order.get("p", 0)
-                        )
-
-                    usd_value = quantity * price
-
-                    if symbol != "BTCUSDT":
-                        continue
-
-                    if usd_value < MIN_USD:
-                        continue
-
-                    if side == "SELL":
-
-                        liquidation_type = (
-                            "LONG LIQUIDATION"
-                        )
-
-                    elif side == "BUY":
-
-                        liquidation_type = (
-                            "SHORT LIQUIDATION"
-                        )
-
-                    else:
-                        continue
-
-                    payload = {
-
-                        "source": "BINANCE",
-
-                        "event": "BTC_LIQUIDATION",
-
-                        "symbol": symbol,
-
-                        "side": side,
-
-                        "liquidation_type": liquidation_type,
-
-                        "price": price,
-
-                        "quantity": quantity,
-
-                        "usd_value": round(
-                            usd_value, 2
-                        ),
-
-                        "time": datetime.now(
-                            timezone.utc
-                        ).isoformat()
-
-                    }
-
-                    print(
-                        json.dumps(payload),
-                        flush=True
-                    )
-
-                    await asyncio.to_thread(
-                        send_to_telegram,
-                        payload
-                    )
-
-        except Exception as error:
-
-            print(
-                f"Connection error: {error}",
-                flush=True
-            )
-
-            print(
-                "Reconnecting in 5 seconds...",
-                flush=True
-            )
-
-            await asyncio.sleep(5)
-
-
-# =====================================
-# MAIN
-# =====================================
-
-if __name__ == "__main__":
-
-    Thread(
-        target=start_http_server,
-        daemon=True
-    ).start()
-
-    # Send one test per application startup
-    send_startup_test()
-
-    asyncio.run(monitor())
+        "Not a trading signal
