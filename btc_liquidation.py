@@ -1,18 +1,39 @@
+
 import asyncio
 import json
 import os
 import urllib.request
-import urllib.error
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import websockets
-
 
 # SETTINGS
 BINANCE_WS = "wss://fstream.binance.com/ws/btcusdt@forceOrder"
 MIN_USD = 100_000
-
 MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            self.send_error(404)
+            return
+
+        body = b"BTC Liquidation Monitor running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_http_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"HTTP server listening on port {port}", flush=True)
+    server.serve_forever()
 
 
 def send_to_make(payload):
@@ -29,20 +50,12 @@ def send_to_make(payload):
 
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            print(
-                f"Make response: {response.status}",
-                flush=True
-            )
-
+            print(f"Make response: {response.status}", flush=True)
     except Exception as error:
-        print(
-            f"Make webhook error: {error}",
-            flush=True
-        )
+        print(f"Make webhook error: {error}", flush=True)
 
 
 async def monitor():
-
     print("Starting BTC Liquidation Monitor", flush=True)
 
     while True:
@@ -56,9 +69,7 @@ async def monitor():
                 print("Connected to Binance", flush=True)
 
                 async for message in websocket:
-
                     data = json.loads(message)
-
                     order = data.get("o", {})
 
                     symbol = order.get("s", "")
@@ -72,24 +83,15 @@ async def monitor():
 
                     usd_value = quantity * price
 
-                    if symbol != "BTCUSDT":
-                        continue
-
-                    if usd_value < MIN_USD:
+                    if symbol != "BTCUSDT" or usd_value < MIN_USD:
                         continue
 
                     if side == "SELL":
                         liquidation_type = "LONG LIQUIDATION"
-
                     elif side == "BUY":
                         liquidation_type = "SHORT LIQUIDATION"
-
                     else:
                         continue
-
-                    event_time = datetime.now(
-                        timezone.utc
-                    ).isoformat()
 
                     payload = {
                         "source": "BINANCE",
@@ -101,34 +103,19 @@ async def monitor():
                         "price": price,
                         "quantity": quantity,
                         "usd_value": round(usd_value, 2),
-                        "time": event_time
+                        "time": datetime.now(timezone.utc).isoformat()
                     }
 
-                    print(
-                        json.dumps(payload),
-                        flush=True
-                    )
+                    print(json.dumps(payload), flush=True)
 
-                    await asyncio.to_thread(
-                        send_to_make,
-                        payload
-                    )
+                    await asyncio.to_thread(send_to_make, payload)
 
         except Exception as error:
-
-            print(
-                f"Connection error: {error}",
-                flush=True
-            )
-
-            print(
-                "Reconnecting in 5 seconds...",
-                flush=True
-            )
-
+            print(f"Connection error: {error}", flush=True)
+            print("Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
+    Thread(target=start_http_server, daemon=True).start()
     asyncio.run(monitor())
-    
