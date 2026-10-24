@@ -12,7 +12,6 @@ from threading import Thread
 import websockets
 
 WS_URL = 'wss://stream.bybit.com/v5/public/linear'
-REST_URL = 'https://api.bybit.com/v5/market/kline'
 TOPICS = ['allLiquidation.BTCUSDT', 'kline.5.BTCUSDT', 'kline.15.BTCUSDT']
 MIN_USD = float(os.getenv('MIN_LIQUIDATION_USD', '200'))
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
@@ -56,15 +55,6 @@ def telegram_send(message):
         print(f'TELEGRAM ERROR: {type(exc).__name__}: {exc}', flush=True)
         return False
 
-
-def fetch_candles(interval):
-    params = urllib.parse.urlencode({'category': 'linear', 'symbol': 'BTCUSDT', 'interval': interval, 'limit': 100})
-    with urllib.request.urlopen(REST_URL + '?' + params, timeout=12) as response:
-        data = json.load(response)
-    if data.get('retCode') != 0:
-        raise ValueError('Bybit kline API rejected request')
-    rows = sorted(data['result']['list'], key=lambda x: int(x[0]))
-    return [(int(x[0]), float(x[4])) for x in rows[:-1]]
 
 
 def ema(values, period):
@@ -113,7 +103,10 @@ def trend(interval):
 def direction(liq_type):
     t5, r5 = trend('5')
     t15, r15 = trend('15')
-    if t5 == 'BEARISH' and t15 == 'BEARISH' and liq_type == 'LONG LIQUIDATION':
+    if 'UNKNOWN' in (t5, t15):
+        bias = 'WAIT'
+        explanation = 'WARMING UP: collecting confirmed candles for EMA9/EMA21/RSI7.'
+    elif t5 == 'BEARISH' and t15 == 'BEARISH' and liq_type == 'LONG LIQUIDATION':
         bias = 'SHORT BIAS'
         explanation = 'Long liquidations align with bearish 5m and 15m trends.'
     elif t5 == 'BULLISH' and t15 == 'BULLISH' and liq_type == 'SHORT LIQUIDATION':
@@ -178,8 +171,8 @@ def alert_message(event):
         f'Quantity: {quantity:.6f} BTC\n'
         f'Time UTC: {stamp}\n\n'
         '📊 MARKET DIRECTION (closed candles)\n'
-        f'5m: {t5} | RSI7: {fmt_rsi(r5)}\n'
-        f'15m: {t15} | RSI7: {fmt_rsi(r15)}\n'
+        f'5m: {t5 if t5 != "UNKNOWN" else "WARMING UP"} | RSI7: {fmt_rsi(r5)} | candles: {len(candles["5"])}\n'
+        f'15m: {t15 if t15 != "UNKNOWN" else "WARMING UP"} | RSI7: {fmt_rsi(r15)} | candles: {len(candles["15"])}\n'
         f'Suggestion: {bias}\n'
         f'Reason: {reason}\n\n'
         '⚠️ Experimental context, NOT a trade signal. '
@@ -188,14 +181,8 @@ def alert_message(event):
 
 
 async def bootstrap():
-    for interval in ('5', '15'):
-        try:
-            rows = await asyncio.to_thread(fetch_candles, interval)
-            candles[interval].clear()
-            candles[interval].extend(rows)
-            print(f'KLINE {interval}m LOADED: {len(rows)}', flush=True)
-        except Exception as exc:
-            print(f'KLINE {interval}m ERROR: {type(exc).__name__}: {exc}', flush=True)
+    print('KLINE HISTORY: WebSocket only; collecting confirmed candles.', flush=True)
+    print('KLINE WARMUP: 5m and 15m trends need at least 23 closed candles.', flush=True)
 
 
 async def heartbeat(ws):
@@ -235,6 +222,7 @@ async def monitor():
                                     history[-1] = (start, close)
                                 elif not history or start > history[-1][0]:
                                     history.append((start, close))
+                                    print(f'KLINE {interval}m CLOSED: {len(history)} candles', flush=True)
                             continue
                         if topic != TOPICS[0]:
                             continue
