@@ -1,9 +1,9 @@
+
 import asyncio
 import json
 import os
 import urllib.parse
 import urllib.request
-
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -11,17 +11,16 @@ from threading import Thread
 import websockets
 
 
-# ==========================================
+# =====================================
 # SMART FUTURES V11 PRO
-# BYBIT BTC LIQUIDATION MONITOR
-# ==========================================
+# BTC LIQUIDATION MONITOR
+# =====================================
 
-BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
+BINANCE_WS = (
+    "wss://fstream.binance.com/ws/"
+    "btcusdt@forceOrder"
+)
 
-SYMBOL = "BTCUSDT"
-TOPIC = f"allLiquidation.{SYMBOL}"
-
-# TEST MODE
 MIN_USD = 200
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
@@ -33,9 +32,9 @@ TELEGRAM_CHAT_ID = os.environ.get(
 )
 
 
-# ==========================================
-# RENDER HEALTH SERVER
-# ==========================================
+# =====================================
+# HEALTH SERVER FOR RENDER
+# =====================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
@@ -45,7 +44,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        body = b"Smart Futures V11 PRO - Bybit Monitor"
+        body = b"SMART FUTURES V11 PRO RUNNING"
 
         self.send_response(200)
 
@@ -80,11 +79,11 @@ def start_http_server():
     server.serve_forever()
 
 
-# ==========================================
-# TELEGRAM
-# ==========================================
+# =====================================
+# TELEGRAM MESSAGE FUNCTION
+# =====================================
 
-def send_telegram_message(message):
+def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
         print(
@@ -121,7 +120,7 @@ def send_telegram_message(message):
 
         with urllib.request.urlopen(
             request,
-            timeout=10
+            timeout=15
         ) as response:
 
             result = json.load(response)
@@ -140,8 +139,6 @@ def send_telegram_message(message):
                 flush=True
             )
 
-            return False
-
     except Exception as error:
 
         print(
@@ -149,26 +146,259 @@ def send_telegram_message(message):
             flush=True
         )
 
-        return False
+    return False
 
 
-# ==========================================
-# STARTUP TEST
-# ==========================================
+# =====================================
+# STARTUP TELEGRAM TEST
+# =====================================
 
-def send_startup_test():
-
-    print(
-        "Starting Telegram connection test...",
-        flush=True
-    )
+def telegram_startup_test():
 
     message = (
         "SMART FUTURES V11 PRO\n\n"
-        "BYBIT CONNECTION TEST\n\n"
+        "Telegram Connection Test\n\n"
         "Render service started.\n"
-        "Source: BYBIT FUTURES\n"
-        "Asset: BTCUSDT\n"
-        "Minimum liquidation: $200\n\n"
+        "BTC Liquidation Monitor active.\n"
+        f"Minimum liquidation: ${MIN_USD:,}\n\n"
+        "Source: Binance Futures\n"
         "Status: TEST MESSAGE\n\n"
-        "Not a trading signal
+        "This is not a trade signal."
+    )
+
+    success = send_telegram(message)
+
+    if success:
+        print(
+            "TELEGRAM TEST SUCCESS",
+            flush=True
+        )
+    else:
+        print(
+            "TELEGRAM TEST FAILED",
+            flush=True
+        )
+
+
+# =====================================
+# LIQUIDATION PROCESSING
+# =====================================
+
+def process_liquidation(data):
+
+    order = data.get("o", {})
+
+    symbol = order.get("s", "")
+
+    if symbol != "BTCUSDT":
+        return None
+
+    side = order.get("S", "")
+
+    try:
+
+        quantity = float(order.get("q", 0))
+
+        price = float(order.get("ap", 0))
+
+        if price <= 0:
+            price = float(order.get("p", 0))
+
+    except (ValueError, TypeError):
+        return None
+
+    if quantity <= 0 or price <= 0:
+        return None
+
+    usd_value = quantity * price
+
+    if usd_value < MIN_USD:
+        return None
+
+    if side == "SELL":
+
+        liquidation_type = "LONG LIQUIDATION"
+
+    elif side == "BUY":
+
+        liquidation_type = "SHORT LIQUIDATION"
+
+    else:
+        return None
+
+    event_time = data.get("E")
+
+    if event_time:
+
+        timestamp = datetime.fromtimestamp(
+            event_time / 1000,
+            tz=timezone.utc
+        )
+
+    else:
+
+        timestamp = datetime.now(timezone.utc)
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "liquidation_type": liquidation_type,
+        "price": price,
+        "quantity": quantity,
+        "usd_value": round(usd_value, 2),
+        "time": timestamp.isoformat()
+    }
+
+
+# =====================================
+# REAL LIQUIDATION TELEGRAM ALERT
+# =====================================
+
+def send_liquidation_alert(payload):
+
+    liquidation_type = payload[
+        "liquidation_type"
+    ]
+
+    if liquidation_type == "LONG LIQUIDATION":
+
+        direction = "🔴 LONG LIQUIDATION"
+
+    else:
+
+        direction = "🟢 SHORT LIQUIDATION"
+
+    message = (
+        "🚨 SMART FUTURES V11 PRO\n"
+        "📊 BTC LIQUIDATION ALERT\n\n"
+        f"Type: {direction}\n"
+        f"Symbol: {payload['symbol']}\n"
+        f"Price: ${payload['price']:,.2f}\n"
+        f"Value: ${payload['usd_value']:,.2f}\n"
+        f"Quantity: {payload['quantity']:.6f} BTC\n\n"
+        "Source: BINANCE FUTURES\n"
+        f"Time UTC: {payload['time']}\n\n"
+        "⚠️ Market data only. "
+        "Not a trade signal."
+    )
+
+    return send_telegram(message)
+
+
+# =====================================
+# BINANCE WEBSOCKET MONITOR
+# =====================================
+
+async def monitor():
+
+    print(
+        "Starting BTC Liquidation Monitor",
+        flush=True
+    )
+
+    print(
+        f"Minimum liquidation: ${MIN_USD:,}",
+        flush=True
+    )
+
+    await asyncio.to_thread(
+        telegram_startup_test
+    )
+
+    while True:
+
+        try:
+
+            print(
+                "Connecting to Binance Futures...",
+                flush=True
+            )
+
+            async with websockets.connect(
+                BINANCE_WS,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=30
+            ) as websocket:
+
+                print(
+                    "Connected to Binance",
+                    flush=True
+                )
+
+                async for message in websocket:
+
+                    try:
+
+                        data = json.loads(message)
+
+                        payload = process_liquidation(
+                            data
+                        )
+
+                        if payload is None:
+                            continue
+
+                        print(
+                            "LIQUIDATION DETECTED",
+                            flush=True
+                        )
+
+                        print(
+                            json.dumps(payload),
+                            flush=True
+                        )
+
+                        success = await asyncio.to_thread(
+                            send_liquidation_alert,
+                            payload
+                        )
+
+                        if success:
+
+                            print(
+                                "LIQUIDATION ALERT SENT",
+                                flush=True
+                            )
+
+                        else:
+
+                            print(
+                                "LIQUIDATION ALERT FAILED",
+                                flush=True
+                            )
+
+                    except Exception as error:
+
+                        print(
+                            f"Processing error: {error}",
+                            flush=True
+                        )
+
+        except Exception as error:
+
+            print(
+                f"Connection error: {error}",
+                flush=True
+            )
+
+            print(
+                "Reconnecting in 5 seconds...",
+                flush=True
+            )
+
+            await asyncio.sleep(5)
+
+
+# =====================================
+# MAIN
+# =====================================
+
+if __name__ == "__main__":
+
+    Thread(
+        target=start_http_server,
+        daemon=True
+    ).start()
+
+    asyncio.run(monitor())
