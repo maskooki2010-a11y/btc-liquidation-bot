@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import os
@@ -11,7 +10,6 @@ from threading import Thread
 from urllib.error import HTTPError
 
 import websockets
-
 
 # =====================================
 # SMART FUTURES V11 PRO
@@ -33,7 +31,6 @@ TELEGRAM_CHAT_ID = os.environ.get(
 
 seen_events = set()
 recent_events = deque(maxlen=3000)
-
 
 # =====================================
 # HEALTH SERVER
@@ -60,7 +57,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-
 def start_http_server():
     port = int(os.environ.get("PORT", "10000"))
 
@@ -75,7 +71,6 @@ def start_http_server():
     )
 
     server.serve_forever()
-
 
 # =====================================
 # TELEGRAM
@@ -141,7 +136,6 @@ def send_telegram(message):
 
     return False
 
-
 # =====================================
 # STARTUP TEST
 # =====================================
@@ -166,7 +160,6 @@ def startup_test():
         print("TELEGRAM TEST SUCCESS", flush=True)
     else:
         print("TELEGRAM TEST FAILED", flush=True)
-
 
 # =====================================
 # LIQUIDATION PROCESSING
@@ -231,7 +224,6 @@ def process_liquidation(item):
         "timestamp_ms": timestamp_ms
     }
 
-
 # =====================================
 # LIQUIDATION ALERT
 # =====================================
@@ -254,7 +246,6 @@ def send_liquidation_alert(payload):
 
     return send_telegram(message)
 
-
 # =====================================
 # WEBSOCKET HEARTBEAT
 # =====================================
@@ -267,7 +258,6 @@ async def heartbeat(websocket):
         await websocket.send(
             json.dumps({"op": "ping"})
         )
-
 
 # =====================================
 # BYBIT MONITOR
@@ -436,7 +426,6 @@ async def monitor():
         )
 
         await asyncio.sleep(5)
-
 
 # =====================================
 # MAIN
