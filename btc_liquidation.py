@@ -3,311 +3,235 @@ import json
 import os
 import urllib.parse
 import urllib.request
-from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
 import websockets
 
-# ======================================
-# SMART FUTURES V11
-# BTC LIQUIDATION ONLY
-# ======================================
+WS_URL = 'wss://stream.bybit.com/v5/public/linear'
+TOPIC = 'allLiquidation.BTCUSDT'
 
-WS_URL = "wss://stream.bybit.com/v5/public/linear"
+MIN_USD = float(os.getenv('MIN_LIQUIDATION_USD', '200'))
 
-TOPIC = "allLiquidation.BTCUSDT"
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
-MIN_USD = float(
-    os.getenv("MIN_LIQUIDATION_USD", "500")
-)
-
-TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-
-CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
-
-
-# ======================================
-# RENDER HEALTH SERVER
-# ======================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
-        if self.path.split("?")[0] not in ("/", "/health"):
+        if self.path.split('?')[0] not in ('/', '/health'):
             self.send_error(404)
             return
 
-        body = b"SMART FUTURES BTC LIQUIDATION RUNNING"
+        body = b'SMART FUTURES V11 BYBIT RUNNING'
 
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        return
 
-
-def health_server():
-    port = int(os.getenv("PORT", "10000"))
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
+def serve_health():
+    port = int(os.getenv('PORT', '10000'))
+    ThreadingHTTPServer(
+        ('0.0.0.0', port),
         HealthHandler
-    )
+    ).serve_forever()
 
-    print("HTTP SERVER STARTED", flush=True)
-    server.serve_forever()
-
-
-# ======================================
-# TELEGRAM
-# ======================================
 
 def telegram_send(message):
-
     if not TOKEN or not CHAT_ID:
-        print("TELEGRAM CONFIG MISSING", flush=True)
+        print('TELEGRAM CONFIG MISSING', flush=True)
         return False
 
-    url = (
-        "https://api.telegram.org/bot"
-        + TOKEN
-        + "/sendMessage"
-    )
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
 
-    data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message
-    }).encode("utf-8")
+    body = urllib.parse.urlencode({
+        'chat_id': CHAT_ID,
+        'text': message
+    }).encode()
 
     try:
         request = urllib.request.Request(
             url,
-            data=data,
-            method="POST"
+            data=body,
+            method='POST'
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=12
-        ) as response:
+        with urllib.request.urlopen(request, timeout=12) as response:
             result = json.load(response)
 
-        if result.get("ok") is True:
-            print("TELEGRAM SENT", flush=True)
-            return True
+        success = result.get('ok') is True
 
-        print("TELEGRAM API ERROR", flush=True)
-        return False
-
-    except Exception as error:
         print(
-            f"TELEGRAM ERROR: {error}",
+            'TELEGRAM SENT' if success else 'TELEGRAM API ERROR',
             flush=True
         )
+
+        return success
+
+    except Exception as exc:
+        print(f'TELEGRAM ERROR: {exc}', flush=True)
         return False
 
 
-# ======================================
-# LIQUIDATION MONITOR
-# ======================================
+def parse_liquidation(item):
+    if not isinstance(item, dict):
+        return None
 
-async def liquidation_monitor():
+    if item.get('s') != 'BTCUSDT':
+        return None
 
-    seen = set()
-    seen_order = deque()
+    try:
+        quantity = float(item.get('v', 0))
+        price = float(item.get('p', 0))
+        event_ms = int(item.get('T', 0))
+    except (ValueError, TypeError):
+        return None
 
-    print(
-        f"LIQUIDATION MONITOR STARTED: ${MIN_USD}",
-        flush=True
+    if quantity <= 0 or price <= 0 or event_ms <= 0:
+        return None
+
+    usd = quantity * price
+
+    if usd < MIN_USD:
+        return None
+
+    side = item.get('S')
+
+    if side == 'Buy':
+        liq_type = 'SHORT LIQUIDATED'
+        marker = '🟢'
+    elif side == 'Sell':
+        liq_type = 'LONG LIQUIDATED'
+        marker = '🔴'
+    else:
+        return None
+
+    return liq_type, marker, quantity, price, usd, event_ms
+
+
+def alert_message(event):
+    liq_type, marker, quantity, price, usd, event_ms = event
+
+    stamp = datetime.fromtimestamp(
+        event_ms / 1000,
+        tz=timezone.utc
+    ).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    return (
+        '🚨 SMART FUTURES V11 PRO | BYBIT\n\n'
+        f'{marker} {liq_type}\n'
+        'Symbol: BTCUSDT\n'
+        f'Bankruptcy Price: ${price:,.2f}\n'
+        f'Estimated Value: ${usd:,.2f}\n'
+        f'Quantity: {quantity:.6f} BTC\n'
+        f'Time: {stamp}\n\n'
+        f'Minimum Alert: ${MIN_USD:,.0f}'
+    )
+
+
+async def heartbeat(ws):
+    while True:
+        await asyncio.sleep(20)
+        await ws.send(json.dumps({'op': 'ping'}))
+
+
+async def monitor():
+    print(f'START BYBIT MIN_USD={MIN_USD}', flush=True)
+
+    await asyncio.to_thread(
+        telegram_send,
+        '✅ SMART FUTURES V11 PRO\n'
+        'Bybit connected startup test.\n'
+        f'Minimum liquidation: ${MIN_USD:,.0f}'
     )
 
     while True:
+        ping_task = None
 
         try:
             async with websockets.connect(
                 WS_URL,
                 ping_interval=20,
                 ping_timeout=20,
-                open_timeout=30
+                open_timeout=30,
+                max_size=2_000_000
             ) as ws:
 
-                print(
-                    "BYBIT WEBSOCKET CONNECTED",
-                    flush=True
-                )
+                print('Connected to Bybit', flush=True)
 
                 await ws.send(json.dumps({
-                    "op": "subscribe",
-                    "args": [TOPIC]
+                    'op': 'subscribe',
+                    'args': [TOPIC]
                 }))
 
-                print(
-                    "LIQUIDATION SUBSCRIPTION REQUESTED",
-                    flush=True
-                )
+                ping_task = asyncio.create_task(heartbeat(ws))
 
                 async for raw in ws:
+                    try:
+                        message = json.loads(raw)
 
-                    message = json.loads(raw)
-
-                    if message.get("op") == "subscribe":
-                        print(
-                            "SUBSCRIPTION RESPONSE:",
-                            message.get("success"),
-                            flush=True
-                        )
-                        continue
-
-                    if message.get("topic") != TOPIC:
-                        continue
-
-                    events = message.get("data", [])
-
-                    if isinstance(events, dict):
-                        events = [events]
-
-                    for item in events:
-
-                        try:
-                            if item.get("s") != "BTCUSDT":
-                                continue
-
-                            price = float(item.get("p", 0))
-                            qty = float(item.get("v", 0))
-                            side = item.get("S")
-                            stamp = int(item.get("T", 0))
-
-                            if price <= 0 or qty <= 0:
-                                continue
-
-                            if side not in ("Buy", "Sell"):
-                                continue
-
-                            value = price * qty
-
-                            if value < MIN_USD:
-                                continue
-
-                            key = (
-                                stamp,
-                                side,
-                                price,
-                                qty
+                        if message.get('op') == 'subscribe':
+                            print(
+                                'BYBIT SUBSCRIPTION SUCCESS'
+                                if message.get('success')
+                                else 'BYBIT SUBSCRIPTION FAILED',
+                                flush=True
                             )
+                            continue
 
-                            if key in seen:
+                        if message.get('topic') != TOPIC:
+                            continue
+
+                        events = message.get('data', [])
+
+                        if isinstance(events, dict):
+                            events = [events]
+
+                        for item in events:
+                            event = parse_liquidation(item)
+
+                            if event is None:
                                 continue
-
-                            if len(seen_order) >= 3000:
-                                old = seen_order.popleft()
-                                seen.discard(old)
-
-                            seen.add(key)
-                            seen_order.append(key)
-
-                            # Bybit liquidation side:
-                            # Sell = LONG liquidated
-                            # Buy  = SHORT liquidated
-
-                            if side == "Sell":
-                                kind = "LONG LIQUIDATED"
-                                emoji = "🔴"
-                            else:
-                                kind = "SHORT LIQUIDATED"
-                                emoji = "🟢"
-
-                            timestamp = datetime.fromtimestamp(
-                                stamp / 1000,
-                                tz=timezone.utc
-                            ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-                            alert = (
-                                "🚨 SMART FUTURES V11 PRO\n\n"
-                                f"{emoji} BTC LIQUIDATION\n\n"
-                                f"Type: {kind}\n"
-                                "Symbol: BTCUSDT\n"
-                                f"Price: ${price:,.2f}\n"
-                                f"Quantity: {qty:.6f} BTC\n"
-                                f"Value: ${value:,.2f}\n"
-                                f"Time: {timestamp}\n\n"
-                                "Source: Bybit Futures\n"
-                                "⚡ LIQUIDATION ALERT ONLY"
-                            )
 
                             print(
-                                f"LIQ EVENT: {kind} ${value:,.2f}",
+                                'BYBIT LIQUIDATION DETECTED',
                                 flush=True
                             )
 
-                            await asyncio.to_thread(
+                            sent = await asyncio.to_thread(
                                 telegram_send,
-                                alert
+                                alert_message(event)
                             )
 
-                        except Exception as error:
                             print(
-                                f"LIQ EVENT ERROR: {error}",
+                                'LIQUIDATION ALERT SENT'
+                                if sent
+                                else 'LIQUIDATION ALERT FAILED',
                                 flush=True
                             )
 
-        except Exception as error:
-            print(
-                f"WEBSOCKET ERROR: {error}",
-                flush=True
-            )
+                    except Exception as exc:
+                        print(f'MESSAGE ERROR: {exc}', flush=True)
 
-        print(
-            "RECONNECTING IN 5 SECONDS",
-            flush=True
-        )
+        except Exception as exc:
+            print(f'CONNECTION ERROR: {exc}', flush=True)
+
+        finally:
+            if ping_task is not None:
+                ping_task.cancel()
+
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
 
         await asyncio.sleep(5)
 
 
-# ======================================
-# STARTUP
-# ======================================
-
-async def main():
-
-    print(
-        "SMART FUTURES V11 STARTING",
-        flush=True
-    )
-
-    print(
-        f"MIN LIQUIDATION: ${MIN_USD}",
-        flush=True
-    )
-
-    await asyncio.to_thread(
-        telegram_send,
-        (
-            "✅ SMART FUTURES V11 STARTED\n\n"
-            "BTC Liquidation Monitor\n"
-            f"Minimum: ${MIN_USD:,.0f}\n"
-            "Source: Bybit Futures\n\n"
-            "Liquidation alerts only"
-        )
-    )
-
-    await liquidation_monitor()
-
-
-if __name__ == "__main__":
-
-    Thread(
-        target=health_server,
-        daemon=True
-    ).start()
-
-    asyncio.run(main())
+if __name__ == '__main__':
+    Thread(target=serve_health, daemon=True).start()
+    asyncio.run(monitor())
