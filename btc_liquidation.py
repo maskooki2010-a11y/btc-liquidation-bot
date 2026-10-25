@@ -1,6 +1,8 @@
+
 import asyncio
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -13,13 +15,17 @@ import websockets
 
 # =====================================
 # SMART FUTURES V11 PRO
-# BYBIT BTC LIQUIDATION MONITOR
-# BYBIT -> RENDER -> TELEGRAM
+# BYBIT LIQUIDATION + WATCHDOG
 # =====================================
 
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 TOPIC = "allLiquidation.BTCUSDT"
+
 MIN_USD = 200
+
+CHECK_INTERVAL = 30
+PING_TIMEOUT = 15
+RECONNECT_DELAY = 5
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", ""
@@ -31,6 +37,15 @@ TELEGRAM_CHAT_ID = os.environ.get(
 
 seen_events = set()
 recent_events = deque(maxlen=3000)
+
+status = {
+    "connected": False,
+    "subscribed": False,
+    "last_message": None,
+    "last_liquidation": None,
+    "last_check": None,
+    "last_error": None
+}
 
 # =====================================
 # HEALTH SERVER
@@ -45,15 +60,16 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
-        body = b"SMART FUTURES V11 BYBIT RUNNING"
+        if path == "/health":
+            body = json.dumps(status).encode("utf-8")
+            content_type = "application/json"
+        else:
+            body = b"SMART FUTURES V11 BYBIT RUNNING"
+            content_type = "text/plain; charset=utf-8"
 
         self.send_response(200)
-        self.send_header(
-            "Content-Type", "text/plain; charset=utf-8"
-        )
-        self.send_header(
-            "Content-Length", str(len(body))
-        )
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -65,11 +81,7 @@ def start_http_server():
         HealthHandler
     )
 
-    print(
-        f"HTTP server listening on port {port}",
-        flush=True
-    )
-
+    print(f"HTTP server on port {port}", flush=True)
     server.serve_forever()
 
 # =====================================
@@ -79,10 +91,7 @@ def start_http_server():
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(
-            "ERROR: Telegram credentials missing",
-            flush=True
-        )
+        print("Telegram credentials missing", flush=True)
         return False
 
     url = (
@@ -107,7 +116,6 @@ def send_telegram(message):
             request,
             timeout=15
         ) as response:
-
             result = json.load(response)
 
             if result.get("ok") is True:
@@ -117,11 +125,6 @@ def send_telegram(message):
                 )
                 return True
 
-            print(
-                "Telegram API returned an error",
-                flush=True
-            )
-
     except HTTPError as error:
         print(
             f"Telegram HTTP error: {error.code}",
@@ -130,36 +133,16 @@ def send_telegram(message):
 
     except Exception as error:
         print(
-            f"Telegram send error: {type(error).__name__}",
+            f"Telegram error: {error}",
             flush=True
         )
 
     return False
 
-# =====================================
-# STARTUP TEST
-# =====================================
-
-def startup_test():
-
-    message = (
-        "SMART FUTURES V11 PRO\n\n"
-        "BYBIT CONNECTION TEST\n\n"
-        "Render application started.\n"
-        "Source: BYBIT FUTURES\n"
-        "Symbol: BTCUSDT\n"
-        f"Minimum liquidation: ${MIN_USD:,}\n\n"
-        "Status: TELEGRAM TEST\n\n"
-        "Waiting for Bybit connection.\n"
-        "Not a trade signal."
+async def notify(message):
+    return await asyncio.to_thread(
+        send_telegram, message
     )
-
-    success = send_telegram(message)
-
-    if success:
-        print("TELEGRAM TEST SUCCESS", flush=True)
-    else:
-        print("TELEGRAM TEST FAILED", flush=True)
 
 # =====================================
 # LIQUIDATION PROCESSING
@@ -180,7 +163,7 @@ def process_liquidation(item):
     except (ValueError, TypeError, OverflowError):
         return None
 
-    if quantity <= 0 or price <= 0:
+    if quantity <= 0 or price <= 0 or timestamp_ms <= 0:
         return None
 
     usd_value = quantity * price
@@ -190,19 +173,11 @@ def process_liquidation(item):
 
     side = item.get("S", "")
 
-    # Bybit reports the liquidated position side.
     if side == "Buy":
-        liquidation_type = "LONG LIQUIDATION"
         direction = "🔴 LONG LIQUIDATION"
-
     elif side == "Sell":
-        liquidation_type = "SHORT LIQUIDATION"
         direction = "🟢 SHORT LIQUIDATION"
-
     else:
-        return None
-
-    if timestamp_ms <= 0:
         return None
 
     event_time = datetime.fromtimestamp(
@@ -211,11 +186,8 @@ def process_liquidation(item):
     ).isoformat()
 
     return {
-        "source": "BYBIT",
-        "event": "BTC_LIQUIDATION",
         "symbol": "BTCUSDT",
         "side": side,
-        "liquidation_type": liquidation_type,
         "direction": direction,
         "price": price,
         "quantity": quantity,
@@ -224,11 +196,7 @@ def process_liquidation(item):
         "timestamp_ms": timestamp_ms
     }
 
-# =====================================
-# LIQUIDATION ALERT
-# =====================================
-
-def send_liquidation_alert(payload):
+async def send_liquidation_alert(payload):
 
     message = (
         "🚨 SMART FUTURES V11 PRO\n"
@@ -240,24 +208,56 @@ def send_liquidation_alert(payload):
         f"Quantity: {payload['quantity']:.6f} BTC\n\n"
         "Source: BYBIT FUTURES\n"
         f"Time UTC: {payload['time']}\n\n"
-        "🧪 TEST MODE: $200 minimum\n"
+        f"🧪 TEST MODE: ${MIN_USD:,} minimum\n"
         "⚠️ Not a trade signal."
     )
 
-    return send_telegram(message)
+    success = await notify(message)
+
+    if success:
+        print("LIQUIDATION ALERT SENT", flush=True)
+    else:
+        print("LIQUIDATION ALERT FAILED", flush=True)
 
 # =====================================
-# WEBSOCKET HEARTBEAT
+# WATCHDOG
 # =====================================
 
-async def heartbeat(websocket):
+async def watchdog(websocket):
 
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(CHECK_INTERVAL)
 
-        await websocket.send(
-            json.dumps({"op": "ping"})
-        )
+        status["last_check"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        try:
+            pong = await websocket.ping()
+
+            await asyncio.wait_for(
+                pong,
+                timeout=PING_TIMEOUT
+            )
+
+            print(
+                "WATCHDOG OK - BYBIT CONNECTION ALIVE",
+                flush=True
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+            print(
+                f"WATCHDOG FAILED: {error}",
+                flush=True
+            )
+
+            status["last_error"] = str(error)
+
+            await websocket.close()
+            return
 
 # =====================================
 # BYBIT MONITOR
@@ -266,26 +266,28 @@ async def heartbeat(websocket):
 async def monitor():
 
     print(
-        "Starting BYBIT BTC Liquidation Monitor",
+        "Starting SMART FUTURES V11 WATCHDOG",
         flush=True
     )
 
-    print(
-        f"Minimum liquidation: ${MIN_USD:,}",
-        flush=True
+    await notify(
+        "🚀 SMART FUTURES V11 PRO\n\n"
+        "Render application started.\n"
+        "Watchdog enabled.\n"
+        "Source: BYBIT FUTURES\n"
+        "Symbol: BTCUSDT\n"
+        f"Minimum liquidation: ${MIN_USD:,}\n\n"
+        "Waiting for Bybit connection."
     )
 
-    await asyncio.to_thread(startup_test)
+    previously_connected = False
 
     while True:
 
-        ping_task = None
+        watchdog_task = None
 
         try:
-            print(
-                "Connecting to Bybit...",
-                flush=True
-            )
+            print("Connecting to Bybit...", flush=True)
 
             async with websockets.connect(
                 BYBIT_WS,
@@ -295,30 +297,28 @@ async def monitor():
                 max_size=2_000_000
             ) as websocket:
 
-                print(
-                    "Connected to Bybit",
-                    flush=True
-                )
+                status["connected"] = True
+                status["subscribed"] = False
+                status["last_error"] = None
 
-                subscription = {
-                    "op": "subscribe",
-                    "args": [TOPIC]
-                }
+                print("Connected to Bybit", flush=True)
 
                 await websocket.send(
-                    json.dumps(subscription)
+                    json.dumps({
+                        "op": "subscribe",
+                        "args": [TOPIC]
+                    })
                 )
 
-                print(
-                    f"Subscription requested: {TOPIC}",
-                    flush=True
-                )
-
-                ping_task = asyncio.create_task(
-                    heartbeat(websocket)
+                watchdog_task = asyncio.create_task(
+                    watchdog(websocket)
                 )
 
                 async for raw_message in websocket:
+
+                    status["last_message"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
 
                     try:
                         data = json.loads(raw_message)
@@ -326,14 +326,31 @@ async def monitor():
                         if data.get("op") == "subscribe":
 
                             if data.get("success") is True:
+                                status["subscribed"] = True
+
                                 print(
                                     "BYBIT SUBSCRIPTION SUCCESS",
                                     flush=True
                                 )
+
+                                if previously_connected:
+                                    await notify(
+                                        "🟢 SMART FUTURES V11 PRO\n\n"
+                                        "BYBIT CONNECTION RESTORED\n"
+                                        "Liquidation monitoring resumed."
+                                    )
+                                else:
+                                    await notify(
+                                        "🟢 SMART FUTURES V11 PRO\n\n"
+                                        "BYBIT CONNECTED\n"
+                                        "Liquidation monitoring active."
+                                    )
+
+                                previously_connected = True
+
                             else:
-                                print(
-                                    "BYBIT SUBSCRIPTION FAILED",
-                                    flush=True
+                                raise RuntimeError(
+                                    "Bybit subscription rejected"
                                 )
 
                             continue
@@ -373,6 +390,12 @@ async def monitor():
                             recent_events.append(event_key)
                             seen_events.add(event_key)
 
+                            status["last_liquidation"] = (
+                                datetime.now(
+                                    timezone.utc
+                                ).isoformat()
+                            )
+
                             print(
                                 "BYBIT LIQUIDATION DETECTED",
                                 flush=True
@@ -383,21 +406,13 @@ async def monitor():
                                 flush=True
                             )
 
-                            success = await asyncio.to_thread(
-                                send_liquidation_alert,
-                                payload
-                            )
+                            await send_liquidation_alert(payload)
 
-                            if success:
-                                print(
-                                    "LIQUIDATION ALERT SENT",
-                                    flush=True
-                                )
-                            else:
-                                print(
-                                    "LIQUIDATION ALERT FAILED",
-                                    flush=True
-                                )
+                    except asyncio.CancelledError:
+                        raise
+
+                    except RuntimeError:
+                        raise
 
                     except Exception as error:
                         print(
@@ -405,27 +420,44 @@ async def monitor():
                             flush=True
                         )
 
+        except asyncio.CancelledError:
+            raise
+
         except Exception as error:
+
+            status["last_error"] = str(error)
+
             print(
                 f"Connection error: {error}",
                 flush=True
             )
 
         finally:
-            if ping_task is not None:
-                ping_task.cancel()
+
+            status["connected"] = False
+            status["subscribed"] = False
+
+            if watchdog_task is not None:
+                watchdog_task.cancel()
 
                 try:
-                    await ping_task
+                    await watchdog_task
                 except asyncio.CancelledError:
                     pass
+
+        if previously_connected:
+            await notify(
+                "🔴 SMART FUTURES V11 PRO\n\n"
+                "BYBIT CONNECTION INTERRUPTED\n"
+                "Automatic reconnection in progress."
+            )
 
         print(
             "Reconnecting in 5 seconds...",
             flush=True
         )
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(RECONNECT_DELAY)
 
 # =====================================
 # MAIN
