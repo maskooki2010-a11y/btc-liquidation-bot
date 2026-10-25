@@ -16,6 +16,7 @@ import websockets
 # =====================================
 # SMART FUTURES V11 PRO
 # BYBIT LIQUIDATION + WATCHDOG
+# + PIONEX LIVE PRICE
 # =====================================
 
 BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
@@ -26,6 +27,11 @@ MIN_USD = 200
 CHECK_INTERVAL = 30
 PING_TIMEOUT = 15
 RECONNECT_DELAY = 5
+
+PIONEX_URL = (
+    "https://api.pionex.com/api/v1/market/trades"
+    "?symbol=BTC_USDT_PERP&limit=10"
+)
 
 TELEGRAM_BOT_TOKEN = os.environ.get(
     "TELEGRAM_BOT_TOKEN", ""
@@ -48,7 +54,7 @@ status = {
 }
 
 # =====================================
-# HEALTH SERVER
+# HEALTH SERVER - UNCHANGED
 # =====================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -73,6 +79,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+
 def start_http_server():
     port = int(os.environ.get("PORT", "10000"))
 
@@ -84,8 +91,9 @@ def start_http_server():
     print(f"HTTP server on port {port}", flush=True)
     server.serve_forever()
 
+
 # =====================================
-# TELEGRAM
+# TELEGRAM - UNCHANGED
 # =====================================
 
 def send_telegram(message):
@@ -139,13 +147,79 @@ def send_telegram(message):
 
     return False
 
+
 async def notify(message):
     return await asyncio.to_thread(
         send_telegram, message
     )
 
+
 # =====================================
-# LIQUIDATION PROCESSING
+# NEW: PIONEX LIVE FUTURES PRICE
+# =====================================
+
+def get_pionex_price():
+    request_started = time.time()
+
+    try:
+        request = urllib.request.Request(
+            PIONEX_URL,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "SmartFuturesV11/1.0"
+            }
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=4
+        ) as response:
+            result = json.load(response)
+
+        if result.get("result") is not True:
+            raise ValueError("Pionex response not successful")
+
+        trades = result.get("data", {}).get("trades", [])
+
+        if not trades:
+            raise ValueError("No Pionex trades returned")
+
+        latest = max(
+            trades,
+            key=lambda trade: int(trade["timestamp"])
+        )
+
+        price = float(latest["price"])
+        market_timestamp = int(latest["timestamp"])
+
+        if price <= 0:
+            raise ValueError("Invalid Pionex price")
+
+        received_at = time.time()
+        market_age = received_at - market_timestamp / 1000
+
+        if market_age < -5 or market_age > 30:
+            raise ValueError(
+                f"Stale Pionex trade: {market_age:.1f}s"
+            )
+
+        return {
+            "price": price,
+            "received_at": received_at,
+            "market_age": market_age,
+            "request_seconds": received_at - request_started
+        }
+
+    except Exception as error:
+        print(
+            f"PIONEX PRICE ERROR: {error}",
+            flush=True
+        )
+        return None
+
+
+# =====================================
+# LIQUIDATION PROCESSING - UNCHANGED
 # =====================================
 
 def process_liquidation(item):
@@ -196,7 +270,42 @@ def process_liquidation(item):
         "timestamp_ms": timestamp_ms
     }
 
+
+# =====================================
+# LIQUIDATION ALERT + PIONEX PRICE
+# =====================================
+
 async def send_liquidation_alert(payload):
+
+    # Fetch without blocking the event loop.
+    pionex = await asyncio.to_thread(get_pionex_price)
+
+    if pionex is not None:
+        difference = pionex["price"] - payload["price"]
+        difference_pct = (
+            difference / payload["price"] * 100
+        )
+
+        delay = max(
+            0,
+            pionex["received_at"]
+            - payload["timestamp_ms"] / 1000
+        )
+
+        pionex_section = (
+            "📈 PIONEX FUTURES\n"
+            f"Latest Trade: ${pionex['price']:,.2f}\n"
+            f"Price Difference: ${difference:+,.2f}\n"
+            f"Difference: {difference_pct:+.3f}%\n"
+            f"Event Age: {delay:.1f} seconds\n"
+            f"Pionex Trade Age: "
+            f"{pionex['market_age']:.1f} seconds\n\n"
+        )
+    else:
+        pionex_section = (
+            "📈 PIONEX FUTURES\n"
+            "Price: unavailable\n\n"
+        )
 
     message = (
         "🚨 SMART FUTURES V11 PRO\n"
@@ -206,6 +315,7 @@ async def send_liquidation_alert(payload):
         f"Bankruptcy Price: ${payload['price']:,.2f}\n"
         f"Estimated Value: ${payload['usd_value']:,.2f}\n"
         f"Quantity: {payload['quantity']:.6f} BTC\n\n"
+        + pionex_section +
         "Source: BYBIT FUTURES\n"
         f"Time UTC: {payload['time']}\n\n"
         f"🧪 TEST MODE: ${MIN_USD:,} minimum\n"
@@ -219,8 +329,9 @@ async def send_liquidation_alert(payload):
     else:
         print("LIQUIDATION ALERT FAILED", flush=True)
 
+
 # =====================================
-# WATCHDOG
+# WATCHDOG - UNCHANGED
 # =====================================
 
 async def watchdog(websocket):
@@ -259,8 +370,9 @@ async def watchdog(websocket):
             await websocket.close()
             return
 
+
 # =====================================
-# BYBIT MONITOR
+# BYBIT MONITOR - UNCHANGED
 # =====================================
 
 async def monitor():
@@ -459,8 +571,9 @@ async def monitor():
 
         await asyncio.sleep(RECONNECT_DELAY)
 
+
 # =====================================
-# MAIN
+# MAIN - UNCHANGED
 # =====================================
 
 if __name__ == "__main__":
